@@ -1,0 +1,66 @@
+# ③ 실험실 DB 를 매일 개인 AWS S3 로 백업(서버 밖 보관)
+#   1) OIDC 로 AWS 역할을 잠깐 받는다 → GitHub·서버 어디에도 AWS 키를 저장하지 않는다
+#   2) 그 권한으로 '이 파일 하나만 올릴 수 있는' 서명 주소를 만든다(1시간 뒤 만료)
+#   3) ②-2 제한 키로 서버에 "backup" 요청 + 주소를 표준 입력으로 보낸다 → 서버가 덤프해 그 주소로 올린다
+# AWS 역할 권한은 버킷의 lab-db/ 에 '올리기'만. 읽기·지우기는 없다(서버나 CI 가 털려도 기존 백업을 못 건드림)
+name: lab-backup
+
+on:
+  schedule:
+    - cron: '10 20 * * *'   # 매일 05:10 한국 시간(팀 새벽 백업 03:50~04:20 과 겹치지 않게)
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: lab-deploy        # 배포와 같은 줄에 세워 서로 겹치지 않게
+  cancel-in-progress: false
+
+env:
+  BUCKET: your-backup-bucket
+  AWS_REGION: ap-northeast-2
+
+jobs:
+  backup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      id-token: write      # OIDC 토큰 발급(AWS 역할을 받는 데만 씀)
+    steps:
+      - name: AWS 역할 받기(OIDC, 1시간)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_BACKUP_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: terre-lab-backup
+          role-duration-seconds: 3600
+
+      - name: 업로드 전용 주소 만들기 → 서버에 백업 요청
+        env:
+          LAB_HOST: ${{ secrets.LAB_HOST }}
+          LAB_SSH_KEY: ${{ secrets.LAB_SSH_KEY }}
+          LAB_KNOWN_HOSTS: ${{ secrets.LAB_KNOWN_HOSTS }}
+        run: |
+          python3 -m venv /tmp/v && /tmp/v/bin/pip install -q boto3
+          export KEY="lab-db/$(date -u +%Y%m%d-%H%M).dump"
+          url=$(/tmp/v/bin/python - <<'PY'
+          import os, boto3
+          from botocore.config import Config
+          s3 = boto3.client("s3", region_name=os.environ["AWS_REGION"],
+                            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}))
+          print(s3.generate_presigned_url("put_object",
+                Params={"Bucket": os.environ["BUCKET"], "Key": os.environ["KEY"]}, ExpiresIn=3600))
+          PY
+          )
+          echo "::add-mask::$url"
+          echo "올릴 위치: s3://$BUCKET/$KEY"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$LAB_SSH_KEY" > ~/.ssh/lab_key && chmod 600 ~/.ssh/lab_key
+          printf '%s\n' "$LAB_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n' "$url" | ssh -i ~/.ssh/lab_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            "ubuntu@$LAB_HOST" backup
+
+      - name: 키 지우기
+        if: always()
+        run: rm -f ~/.ssh/lab_key

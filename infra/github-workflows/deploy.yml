@@ -1,0 +1,150 @@
+# ②-2 CI/CD: main 에 올리면 검사 → 이미지 3개 빌드·GHCR 푸시 → 실험실 서버에 블루-그린 배포
+#   check  : 인프라 파일이 문법상 맞는지(셸 스크립트, compose, nginx 설정). 틀리면 빌드·배포까지 가지 않는다
+#   build  : backend·web(frontend)·screening 이미지를 커밋 해시 태그로 비공개 GHCR 에 올린다(같은 층은 캐시 재사용)
+#   deploy : 제한 SSH 키로 서버에 "deploy <커밋> <screening 커밋|keep>" 한 줄만 보낸다. 서버는 그 키로 gha-deploy.sh 만 실행할 수 있다
+# 비용: 비공개 저장소 무료 Actions 시간 안에서만 쓴다(결제 수단 없음 → 넘으면 과금이 아니라 실행이 막힌다)
+name: lab-deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'lab/bluegreen/**'
+      - 'lab/pregen/nginx-pregen.conf'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions: {}          # 기본은 아무 권한 없음. 작업마다 필요한 것만 연다
+
+concurrency:
+  group: lab-deploy      # 배포는 한 번에 하나. 뒤에 온 것은 앞 것이 끝날 때까지 기다린다(중간에 끊지 않음)
+  cancel-in-progress: false
+
+env:
+  REG: ghcr.io/kjh-independency
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 셸 스크립트 문법·정적 검사
+        run: |
+          bash -n lab/bluegreen/*.sh
+          shellcheck -S warning lab/bluegreen/*.sh
+
+      - name: compose 구성 검사(가짜 값으로 풀어 보기)
+        env:
+          LAB_DB_USER: ci
+          LAB_DB_PASSWORD: ci
+          LAB_JWT_SECRET: ci
+          LAB_ADMIN_EMAIL: ci@example.invalid
+          LAB_ADMIN_PASSWORD: ci
+          TILES_DIR: /tmp/tiles
+          BLUE_BACKEND_IMAGE: ${{ env.REG }}/terre-backend:${{ github.sha }}
+        run: |
+          touch /tmp/ci.env
+          docker compose -p terre-lab --project-directory lab -f lab/bluegreen/compose.bg.yml --env-file /tmp/ci.env config -q
+          docker compose -p terre-lab --project-directory lab -f lab/bluegreen/compose.bg.yml --env-file /tmp/ci.env config --images | sort -u
+
+      - name: nginx 설정 검사(입구, 색깔별 앱 nginx)
+        run: |
+          mkdir -p /tmp/bg /tmp/tls
+          printf 'upstream app {\n    server web-blue:80;\n    keepalive 16;\n}\n' > /tmp/bg/upstream.conf
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=ci \
+            -keyout /tmp/tls/lab.key -out /tmp/tls/lab.crt 2>/dev/null   # 검사용 일회 인증서
+          docker run --rm --add-host web-blue:127.0.0.1 --add-host web-green:127.0.0.1 \
+            -v "$PWD/lab/bluegreen/edge.conf:/etc/nginx/conf.d/default.conf:ro" -v /tmp/bg:/etc/nginx/bg:ro \
+            -v /tmp/tls:/etc/nginx/tls:ro nginx:1.27-alpine nginx -t
+          docker run --rm --add-host backend:127.0.0.1 --add-host screening:127.0.0.1 \
+            -v "$PWD/lab/pregen/nginx-pregen.conf:/etc/nginx/conf.d/default.conf:ro" \
+            nginx:1.27-alpine nginx -t
+
+  build:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write    # GHCR 에 올리기
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: backend
+            context: app/backend
+          - name: web
+            context: app/frontend
+          - name: screening
+            context: app/screening
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: 빌드·푸시 terre-${{ matrix.name }}:${{ github.sha }}
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: false   # 빌드 기록을 아티팩트로 올리지 않는다(무료 저장 공간 아끼기)
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ env.REG }}/terre-${{ matrix.name }}:${{ github.sha }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: read     # 서버가 이번 배포 동안만 이미지를 받도록 넘겨줄 임시 토큰의 권한
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: screening 이 바뀌었는지(안 바뀌었으면 다시 띄우지 않는다)
+        id: scr
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            if git diff --quiet "$BEFORE" "$GITHUB_SHA" -- app/screening; then v=keep; else v=$GITHUB_SHA; fi
+          else
+            v=keep   # 수동 실행·첫 푸시: screening 은 그대로 둔다
+          fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "screening: $v"
+
+      - name: 제한 키로 배포 요청
+        env:
+          LAB_HOST: ${{ secrets.LAB_HOST }}
+          LAB_SSH_KEY: ${{ secrets.LAB_SSH_KEY }}
+          LAB_KNOWN_HOSTS: ${{ secrets.LAB_KNOWN_HOSTS }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SCR: ${{ steps.scr.outputs.value }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$LAB_SSH_KEY" > ~/.ssh/lab_key && chmod 600 ~/.ssh/lab_key
+          printf '%s\n' "$LAB_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          printf '%s\n' "$GHCR_TOKEN" | ssh -i ~/.ssh/lab_key -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            "ubuntu@$LAB_HOST" "deploy $GITHUB_SHA $SCR"
+
+      - name: 키 지우기
+        if: always()
+        run: rm -f ~/.ssh/lab_key

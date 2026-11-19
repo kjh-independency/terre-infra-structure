@@ -1,0 +1,130 @@
+# terre-lab: 11/6 구성(4ae439fb의 docker-compose.yml)을 같은 서버에서 운영과 분리해 재현한다.
+# 11/6과 같게 둔 것: 서비스 5개, 메모리 상한, 로그 상한, 자동 재시작, backend 준비 상태 검사, web 의 nginx 설정(nginx-1106.conf)
+# 실험실이라 바꾼 것(운영 보호):
+#   - 프로젝트 이름 terre-lab: 컨테이너·네트워크·저장 공간이 운영(terre-service)과 섞이지 않는다
+#   - 모든 서비스를 terrelab.slice 에 넣는다: lab.sh 가 이 묶음 전체에 CPU 2개·메모리 4GB 상한과 낮은 우선순위를 건다
+#   - web 은 서버 안(127.0.0.1:18088)에만 연다. db·redis 는 밖으로 열지 않는다(11/6 은 127.0.0.1:5440·6379)
+#   - 이미지는 지금 운영 이미지에 실험실 이름(terre-lab-*:snap)만 붙여 쓴다. 서버에서 빌드하지 않는다
+#   - 비밀값은 실험실 전용(.env, lab.sh 가 새로 만든다). 운영 .env 는 읽지 않는다
+#   - screening 은 외부 AI 를 부르지 않는 규칙 모드(LLM_PROVIDER=rules, 키 없음)
+#   - 첨부는 11/6처럼 서버 디스크(STORAGE_KIND=local)에 둔다
+name: terre-lab
+
+x-lab: &lab
+  cgroup_parent: terrelab.slice
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  db:
+    <<: *lab
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_DB: terre_init          # 처음 만들어지는 빈 DB. 서비스용 terre 는 lab.sh 가 백업에서 복원한다
+      POSTGRES_USER: ${LAB_DB_USER}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD}
+      TZ: Asia/Seoul
+      PGTZ: Asia/Seoul
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+
+  redis:
+    <<: *lab
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 512m
+
+  backend:
+    <<: *lab
+    image: terre-lab-backend:snap
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_DB: terre
+      POSTGRES_USER: ${LAB_DB_USER}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD}
+      JWT_SECRET: ${LAB_JWT_SECRET}
+      APP_ENV: production
+      ADMIN_EMAIL: ${LAB_ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${LAB_ADMIN_PASSWORD}
+      VWORLD_API_KEY: ""
+      COOKIE_SECURE: "false"
+      UPLOAD_DIR: /data/uploads
+      STORAGE_KIND: local
+      SCREENING_URL: http://screening:8000
+      LLM_PROVIDER: rules
+      DEM_DIR: /tiles/dem
+      TZ: Asia/Seoul
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}   # T3 에서 값을 바꿔 '새 버전 배포'처럼 컨테이너를 다시 만든다
+    volumes:
+      - files:/data
+      - ${TILES_DIR}:/tiles:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf ''GET /actuator/health/readiness HTTP/1.0\r\nHost: localhost\r\n\r\n'' >&3 && grep -q ''"UP"'' <&3'
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s
+    mem_limit: 2g
+
+  screening:
+    <<: *lab
+    image: terre-lab-screening:snap
+    environment:
+      UPLOAD_DIR: /data/uploads
+      APP_ENV: production
+      LLM_PROVIDER: rules
+      LLM_API_BASE: ""
+      LLM_API_KEY: ""
+      LLM_MODEL: ""
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}
+    volumes:
+      - files:/data
+    mem_limit: 1g
+
+  web:
+    <<: *lab
+    image: terre-lab-web:snap
+    environment:
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}
+    ports:
+      - "127.0.0.1:${LAB_WEB_PORT:-18088}:80"
+    volumes:
+      - ./nginx-1106.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    mem_limit: 256m
+
+volumes:
+  dbdata:
+  redisdata:
+  files:

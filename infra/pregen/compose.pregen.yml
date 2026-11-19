@@ -1,0 +1,40 @@
+# terre-lab 개선 1: 경계 타일 미리 생성.
+# compose.lab.yml(11/6 구성) 위에 덧붙이는 파일이다. 빼면 그대로 11/6 구성으로 돌아간다.
+#   적용:  docker compose -p terre-lab -f compose.lab.yml -f pregen/compose.pregen.yml up -d --remove-orphans
+#   되돌리기: docker compose -p terre-lab -f compose.lab.yml up -d --remove-orphans
+services:
+  web:
+    volumes:
+      # 같은 대상 경로라 compose.lab.yml 의 nginx-1106.conf 연결을 이 파일로 바꾼다
+      - ./pregen/nginx-pregen.conf:/etc/nginx/conf.d/default.conf:ro
+      - pregen:/srv/pregen:ro
+
+  # 타일을 미리 만들고, 보호지역 공개 상태가 바뀌는지 5초마다 확인하는 작은 서비스
+  tilegen:
+    image: python:3.12-alpine
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    command: ["python", "-u", "/app/tilegen.py", "watch"]
+    environment:
+      BACKEND: http://backend:8080
+      OUT: /srv/pregen
+      ZMIN: "5"
+      ZMAX: "12"
+      BBOX: "124.0,33.0,132.0,39.0"
+      WORKERS: "2"
+      POLL: "5"
+    volumes:
+      - ./pregen/tilegen.py:/app/tilegen.py:ro
+      - pregen:/srv/pregen
+    depends_on:
+      backend:
+        condition: service_healthy
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  pregen:

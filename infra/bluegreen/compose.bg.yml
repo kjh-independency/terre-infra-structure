@@ -1,0 +1,289 @@
+# terre-lab ②-1 블루-그린 구성 (실험실 전용, 앱 코드·이미지는 그대로)
+# 4-lab-apply → 2 로 켠다. lab.sh·variant.sh 가 이 파일 하나로 실험실을 띄운다(--project-directory = 실험실 폴더).
+#   web            : 입구 nginx. 배포 중에도 내려가지 않는다. 지금 색(state/upstream.conf)으로 넘긴다
+#                    ④ 손님용 HTTPS 18443(평문 18080 은 301), 안쪽 측정용 평문 18088. 모두 127.0.0.1 에만 연다
+#   web-blue/green : 색깔별 앱 nginx(프런트 + 개선 1 미리 만든 타일). 자기 색 네트워크에서 'backend' 이름으로 자기 backend 를 본다
+#   backend-blue/green : 색깔별 backend. db·redis·screening 은 한 벌을 같이 쓴다
+#   tilegen        : 개선 1 그대로. 레이어 목록은 입구(web)를 거쳐 지금 색 backend 에서 받는다
+# db·redis·screening 설정은 compose.lab.yml 과 같게 두어 구성을 바꿔도 다시 만들어지지 않게 했다.
+# ②-2: 이미지는 bg.sh 가 release.env 에서 넘겨주는 변수(색깔별 GHCR 태그). 값이 없으면 처음처럼 :snap 이라 기존 컨테이너는 그대로다.
+name: terre-lab
+services:
+  db:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_DB: terre_init
+      POSTGRES_USER: ${LAB_DB_USER}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD}
+      TZ: Asia/Seoul
+      PGTZ: Asia/Seoul
+    volumes:
+    - dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+      - CMD-SHELL
+      - pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 2g
+  redis:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: redis:7-alpine
+    command:
+    - redis-server
+    - --appendonly
+    - 'yes'
+    - --appendfsync
+    - everysec
+    volumes:
+    - redisdata:/data
+    healthcheck:
+      test:
+      - CMD
+      - redis-cli
+      - ping
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    mem_limit: 512m
+  screening:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: ${SCREENING_IMAGE:-terre-lab-screening:snap}
+    environment:
+      UPLOAD_DIR: /data/uploads
+      APP_ENV: production
+      LLM_PROVIDER: rules
+      LLM_API_BASE: ''
+      LLM_API_KEY: ''
+      LLM_MODEL: ''
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}
+    volumes:
+    - files:/data
+    mem_limit: 1g
+  backend-blue:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: ${BLUE_BACKEND_IMAGE:-terre-lab-backend:snap}
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_DB: terre
+      POSTGRES_USER: ${LAB_DB_USER}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD}
+      JWT_SECRET: ${LAB_JWT_SECRET}
+      APP_ENV: production
+      ADMIN_EMAIL: ${LAB_ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${LAB_ADMIN_PASSWORD}
+      VWORLD_API_KEY: ''
+      COOKIE_SECURE: 'false'
+      UPLOAD_DIR: /data/uploads
+      STORAGE_KIND: local
+      SCREENING_URL: http://screening:8000
+      LLM_PROVIDER: rules
+      DEM_DIR: /tiles/dem
+      TZ: Asia/Seoul
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}
+    volumes:
+    - files:/data
+    - ${TILES_DIR}:/tiles:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD
+      - bash
+      - -c
+      - 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf ''GET /actuator/health/readiness HTTP/1.0\r\nHost: localhost\r\n\r\n'' >&3 && grep -q ''"UP"'' <&3'
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s
+    mem_limit: 2g
+    networks:
+      default: null
+      bg-blue:
+        aliases:
+        - backend
+  web-blue:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: ${BLUE_WEB_IMAGE:-terre-lab-web:snap}
+    environment:
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}
+    volumes:
+    - ./pregen/nginx-pregen.conf:/etc/nginx/conf.d/default.conf:ro
+    - pregen:/srv/pregen:ro
+    depends_on:
+      backend-blue:
+        condition: service_started
+    mem_limit: 256m
+    networks:
+    - default
+    - bg-blue
+  backend-green:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: ${GREEN_BACKEND_IMAGE:-terre-lab-backend:snap}
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      POSTGRES_DB: terre
+      POSTGRES_USER: ${LAB_DB_USER}
+      POSTGRES_PASSWORD: ${LAB_DB_PASSWORD}
+      JWT_SECRET: ${LAB_JWT_SECRET}
+      APP_ENV: production
+      ADMIN_EMAIL: ${LAB_ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${LAB_ADMIN_PASSWORD}
+      VWORLD_API_KEY: ''
+      COOKIE_SECURE: 'false'
+      UPLOAD_DIR: /data/uploads
+      STORAGE_KIND: local
+      SCREENING_URL: http://screening:8000
+      LLM_PROVIDER: rules
+      DEM_DIR: /tiles/dem
+      TZ: Asia/Seoul
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}
+    volumes:
+    - files:/data
+    - ${TILES_DIR}:/tiles:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+      - CMD
+      - bash
+      - -c
+      - 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf ''GET /actuator/health/readiness HTTP/1.0\r\nHost: localhost\r\n\r\n'' >&3 && grep -q ''"UP"'' <&3'
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 60s
+    mem_limit: 2g
+    networks:
+      default: null
+      bg-green:
+        aliases:
+        - backend
+  web-green:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: ${GREEN_WEB_IMAGE:-terre-lab-web:snap}
+    environment:
+      LAB_DEPLOY_ID: ${LAB_DEPLOY_ID:-initial}
+    volumes:
+    - ./pregen/nginx-pregen.conf:/etc/nginx/conf.d/default.conf:ro
+    - pregen:/srv/pregen:ro
+    depends_on:
+      backend-green:
+        condition: service_started
+    mem_limit: 256m
+    networks:
+    - default
+    - bg-green
+  web:
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+    image: nginx:1.27-alpine
+    ports:
+    - 127.0.0.1:${LAB_WEB_PORT:-18088}:80        # 안쪽 전용 평문(서버 안 측정 도구)
+    - 127.0.0.1:${LAB_HTTP_PORT:-18080}:8080     # ④ 손님용 평문 → HTTPS 로 301
+    - 127.0.0.1:${LAB_TLS_PORT:-18443}:443       # ④ 손님용 HTTPS 입구(TLS 종료 + HSTS)
+    volumes:
+    - ./bluegreen/edge.conf:/etc/nginx/conf.d/default.conf:ro
+    - ./bluegreen/state:/etc/nginx/bg:ro
+    - ./bluegreen/tls:/etc/nginx/tls:ro           # ④ 실험용 인증서(tls.sh 가 만듦, 저장소에 넣지 않음)
+    - pregen:/srv/pregen:ro
+    mem_limit: 128m
+  tilegen:
+    image: python:3.12-alpine
+    cgroup_parent: terrelab.slice
+    restart: unless-stopped
+    command:
+    - python
+    - -u
+    - /app/tilegen.py
+    - watch
+    environment:
+      BACKEND: http://web:80
+      OUT: /srv/pregen
+      ZMIN: '5'
+      ZMAX: '12'
+      BBOX: 124.0,33.0,132.0,39.0
+      WORKERS: '2'
+      POLL: '5'
+    volumes:
+    - ./pregen/tilegen.py:/app/tilegen.py:ro
+    - pregen:/srv/pregen
+    depends_on:
+      web:
+        condition: service_started
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '5'
+networks:
+  default: null
+  bg-blue: null
+  bg-green: null
+volumes:
+  dbdata: null
+  redisdata: null
+  files: null
+  pregen: null
